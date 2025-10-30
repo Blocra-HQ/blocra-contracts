@@ -1,0 +1,20 @@
+{
+  "network": "mainnet",
+  "contractAddress": "0x07070d915635269ea0930fa1c538f2d026e02e5078884aeb007141c39f481eee",
+  "transactionHash": "0x002780f4d2832ecdc2d1d59111f9649ad324601d5aff099f306de1c25bc80ac2",
+  "deployedAt": "2025-01-22T12:00:00Z",
+  "deployer": "0x03710675928cc38a18f8793dd6bd6d714c28d69eb09393308acf11b7866e6287",
+  "status": "deployed",
+  "explorer": "https://starkscan.co/contract/0x07070d915635269ea0930fa1c538f2d026e02e5078884aeb007141c39f481eee",
+  "endpoints": {
+    "deposit": "/api/deposit-bounty",
+    "payout": "/api/payout-bounty",
+    "notifications": "/api/send-notification"
+  },
+  "features": {
+    "autoSwappr": true,
+    "emailNotifications": true,
+    "rateLimiting": true,
+    "contractIntegration": true
+  }
+}
