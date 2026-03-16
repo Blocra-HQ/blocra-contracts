@@ -1,103 +1,125 @@
-# 🚀 Starklytics Bounty Contract Deployment
+# BlocRA - Stellar Smart Contracts
 
-## 📋 Overview
+A high-performance smart contract system for bounty management on Stellar built with Soroban.
 
-The Starklytics Bounty Contract is a Cairo smart contract that manages bounty creation, participation, and payouts on Starknet. This guide covers deployment to both Sepolia testnet and mainnet.
+## 🚀 Quick Start
 
-## 📁 Contract Location
+### Prerequisites
+- **Rust** 1.75+ (for smart contracts)
+- **Soroban CLI** (for development and deployment)
+- **Stellar Wallet** (Freighter recommended)
 
-- **Main Contract**: `../src/bounty_contract.cairo`
-- **Library**: `../src/lib.cairo`
-- **Deployment Script**: `../scripts/deploy-contract.sh`
-
-## 💰 Deployment Costs
-
-| Network | Declaration | Deployment | Total Cost |
-|---------|-------------|------------|------------|
-| **Sepolia** | FREE | FREE | **$0** |
-| **Mainnet** | ~$5-12 | ~$2-7 | **$7-19** |
-
-## 🛠️ Prerequisites
-
+### Smart Contract Setup
 ```bash
-# Install Scarb (Cairo package manager)
-curl --proto '=https' --tlsv1.2 -sSf https://docs.swmansion.com/scarb/install.sh | sh
+# Install Soroban CLI
+cargo install soroban-cli
 
-# Install Starkli (Starknet CLI)
-curl https://get.starkli.sh | sh
-starkliup
+# Initialize project (if not already)
+soroban contract init
+
+# Build contracts
+soroban contract build
+
+# Test contracts
+soroban contract test
 ```
 
-## 🔧 Setup Wallet
+## 📋 Environment Variables
 
-### Create Account
+### Required
 ```bash
-# Create keystore
-starkli signer keystore new ~/.starkli-wallets/deployer/keystore.json
-
-# Create account descriptor
-starkli account oz init ~/.starkli-wallets/deployer/account.json
+SOROBAN_NETWORK_PASSPHRASE=Test SDF Network ; September 2015  # For testnet
+# Or for mainnet: Public Global Stellar Network ; September 2015
+SOROBAN_RPC_URL=https://soroban-testnet.stellar.org  # For testnet
+SOROBAN_SECRET_KEY=your-secret-key
 ```
 
-### Fund Account
+## 🏗️ Architecture
 
-#### For Sepolia (FREE)
+- **Language:** Rust
+- **Platform:** Soroban (Stellar smart contracts)
+- **Features:** Bounty creation, participation, payouts
+
+## 📊 Features
+
+- ✅ Bounty creation and management
+- ✅ Participant registration
+- ✅ Reward distribution
+- ✅ Secure escrow system
+
+## 🔧 Development
+
 ```bash
-# Get testnet ETH from faucet
-curl -X POST https://starknet-faucet.vercel.app/api/faucet \
-  -H "Content-Type: application/json" \
-  -d '{"address": "YOUR_ADDRESS_HERE"}'
+# Build contracts
+soroban contract build
+
+# Run tests
+soroban contract test
+
+# Deploy to testnet
+soroban contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/bounty_contract.wasm \
+  --source your-secret-key \
+  --network testnet
 ```
 
-#### For Mainnet
-- Transfer ~$20 worth of ETH to your account
-- Check balance: `starkli balance YOUR_ADDRESS`
+## 📦 Deployment
 
-## 🚀 Deployment Commands
-
-### Option 1: Sepolia Testnet (Recommended)
-
+### Testnet
 ```bash
-# Build contract
-scarb build
-
-# Declare contract
-starkli declare target/dev/starklytics_suite_BountyContract.contract_class.json \
-  --account ~/.starkli-wallets/deployer/account.json \
-  --keystore ~/.starkli-wallets/deployer/keystore.json \
-  --network sepolia
-
-# Deploy contract (replace CLASS_HASH with output from declare)
-starkli deploy CLASS_HASH \
-  --account ~/.starkli-wallets/deployer/account.json \
-  --keystore ~/.starkli-wallets/deployer/keystore.json \
-  --network sepolia
+# Deploy contract
+soroban contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/bounty_contract.wasm \
+  --source your-secret-key \
+  --network testnet
 ```
 
-### Option 2: Mainnet Production
-
+### Mainnet
 ```bash
-# Build contract
-scarb build
-
-# Declare contract
-starkli declare target/dev/starklytics_suite_BountyContract.contract_class.json \
-  --account ~/.starkli-wallets/deployer/account.json \
-  --keystore ~/.starkli-wallets/deployer/keystore.json \
-  --network mainnet
-
-# Deploy contract (replace CLASS_HASH with output from declare)
-starkli deploy CLASS_HASH \
-  --account ~/.starkli-wallets/deployer/account.json \
-  --keystore ~/.starkli-wallets/deployer/keystore.json \
+# Deploy contract
+soroban contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/bounty_contract.wasm \
+  --source your-secret-key \
   --network mainnet
 ```
 
-### Option 3: Automated Script
+## 📚 Documentation
 
-```bash
-# For Sepolia
-./scripts/deploy-contract.sh --network sepolia
+- **Soroban Docs:** https://soroban.stellar.org/docs
+- **Stellar Developer Docs:** https://developers.stellar.org/
+
+## 🔒 Security
+
+- Secure key management
+- Contract invariants
+- Audit-ready code
+
+## 📈 Performance
+
+- Low transaction fees
+- Fast finality
+- Scalable architecture
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+## 📄 License
+
+MIT License - See LICENSE file for details
+
+## 🔗 Links
+
+- **Stellar Explorer:** https://stellar.expert/explorer/testnet
+- **Soroban Playground:** https://playground.soroban.stellar.org/
+
+## 💡 Support
+
+For issues and questions, please open a GitHub issue.
 
 # For Mainnet
 ./scripts/deploy-contract.sh --network mainnet
