@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["bounty"]
+
+# Same lint policy as the stellar-insights contract workspace this layout comes from.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[workspace.dependencies]
+soroban-sdk = "29.0.1"
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true

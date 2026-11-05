@@ -1,0 +1,5 @@
+# Pinned so local and CI builds produce the same WASM bytes.
+[toolchain]
+channel = "1.96.0"
+targets = ["wasm32v1-none"]
+components = ["clippy", "rustfmt"]
