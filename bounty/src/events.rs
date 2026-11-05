@@ -1,62 +1,57 @@
-use soroban_sdk::{symbol_short, Address, Env};
+use soroban_sdk::{symbol_short, Address, BytesN, Env};
 
-pub fn emit_initialized(env: &Env, admin: Address) {
-    env.events().publish((symbol_short!("ESC_INI"),), admin);
-}
+// Topics are (name, bounty_id) so indexers can filter on a single bounty.
 
-pub fn emit_escrow_created(env: &Env, escrow_id: u64, depositor: Address, beneficiary: Address, amount: i128) {
+pub fn emit_bounty_created(env: &Env, bounty_id: u64, creator: Address, reward_amount: i128) {
     env.events().publish(
-        (symbol_short!("ESC_CRT"),),
-        (escrow_id, depositor, beneficiary, amount),
+        (symbol_short!("b_create"), bounty_id),
+        (creator, reward_amount),
     );
 }
 
-pub fn emit_escrow_funded(env: &Env, escrow_id: u64, depositor: Address, amount: i128) {
+pub fn emit_participant_joined(env: &Env, bounty_id: u64, participant: Address) {
+    env.events()
+        .publish((symbol_short!("b_join"), bounty_id), participant);
+}
+
+pub fn emit_solution_submitted(
+    env: &Env,
+    bounty_id: u64,
+    participant: Address,
+    solution_hash: BytesN<32>,
+) {
     env.events().publish(
-        (symbol_short!("ESC_FND"),),
-        (escrow_id, depositor, amount),
+        (symbol_short!("b_submit"), bounty_id),
+        (participant, solution_hash),
     );
 }
 
-pub fn emit_funds_released(env: &Env, escrow_id: u64, beneficiary: Address, amount: i128) {
-    env.events().publish(
-        (symbol_short!("ESC_REL"),),
-        (escrow_id, beneficiary, amount),
-    );
+pub fn emit_winner_selected(env: &Env, bounty_id: u64, winner: Address, amount: i128) {
+    env.events()
+        .publish((symbol_short!("b_winner"), bounty_id), (winner, amount));
 }
 
-pub fn emit_refunded(env: &Env, escrow_id: u64, depositor: Address, amount: i128) {
-    env.events().publish(
-        (symbol_short!("ESC_RFD"),),
-        (escrow_id, depositor, amount),
-    );
+pub fn emit_refunded(env: &Env, bounty_id: u64, creator: Address, amount: i128) {
+    env.events()
+        .publish((symbol_short!("b_refund"), bounty_id), (creator, amount));
 }
 
-pub fn emit_dispute_raised(env: &Env, escrow_id: u64, raised_by: Address) {
-    env.events().publish(
-        (symbol_short!("ESC_DIS"),),
-        (escrow_id, raised_by),
-    );
+pub fn emit_cancelled(env: &Env, bounty_id: u64, creator: Address, amount: i128) {
+    env.events()
+        .publish((symbol_short!("b_cancel"), bounty_id), (creator, amount));
 }
 
-pub fn emit_dispute_resolved(env: &Env, escrow_id: u64, winner: Address, amount: i128) {
-    env.events().publish(
-        (symbol_short!("ESC_RSV"),),
-        (escrow_id, winner, amount),
-    );
+pub fn emit_dispute_raised(env: &Env, bounty_id: u64, raised_by: Address) {
+    env.events()
+        .publish((symbol_short!("b_dispute"), bounty_id), raised_by);
 }
 
-pub fn emit_cancelled(env: &Env, escrow_id: u64, cancelled_by: Address) {
-    env.events().publish(
-        (symbol_short!("ESC_CAN"),),
-        (escrow_id, cancelled_by),
-    );
+pub fn emit_dispute_resolved(env: &Env, bounty_id: u64, recipient: Address, amount: i128) {
+    env.events()
+        .publish((symbol_short!("b_resolve"), bounty_id), (recipient, amount));
 }
 
-pub fn emit_paused(env: &Env, admin: Address) {
-    env.events().publish((symbol_short!("ESC_PAU"),), admin);
-}
-
-pub fn emit_unpaused(env: &Env, admin: Address) {
-    env.events().publish((symbol_short!("ESC_UNP"),), admin);
+pub fn emit_paused(env: &Env, admin: Address, paused: bool) {
+    env.events()
+        .publish((symbol_short!("paused"),), (admin, paused));
 }

@@ -5,325 +5,311 @@
 
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, Address, Env,
+    token::{Client as TokenClient, StellarAssetClient},
+    Address, BytesN, Env, String,
 };
 
-use crate::{EscrowServiceContract, EscrowServiceContractClient, EscrowState};
+use crate::{BountyContract, BountyContractClient, BountyStatus, Error};
 
-fn advance_time(env: &Env, seconds: u64) {
-    env.ledger().with_mut(|li| {
-        li.timestamp += seconds;
-    });
+const REWARD: i128 = 5_000_000;
+const HOUR: u64 = 3_600;
+
+struct Setup<'a> {
+    env: &'a Env,
+    client: BountyContractClient<'a>,
+    token: TokenClient<'a>,
+    admin: Address,
+    creator: Address,
+}
+
+fn setup(env: &Env) -> Setup<'_> {
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+    let admin = Address::generate(env);
+    let creator = Address::generate(env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    StellarAssetClient::new(env, &token_id).mint(&creator, &(REWARD * 10));
+
+    let id = env.register(BountyContract, (admin.clone(),));
+    Setup {
+        env,
+        client: BountyContractClient::new(env, &id),
+        token: TokenClient::new(env, &token_id),
+        admin,
+        creator,
+    }
+}
+
+fn s(env: &Env, v: &str) -> String {
+    String::from_str(env, v)
+}
+
+fn hash(env: &Env, b: u8) -> BytesN<32> {
+    BytesN::from_array(env, &[b; 32])
+}
+
+fn create(t: &Setup, max_participants: u32) -> u64 {
+    let deadline = t.env.ledger().timestamp() + HOUR;
+    t.client.create_bounty(
+        &t.creator,
+        &t.token.address,
+        &s(t.env, "Top DEX by volume"),
+        &s(t.env, "Rank Stellar DEX pairs by 30-day volume"),
+        &REWARD,
+        &deadline,
+        &max_participants,
+    )
+}
+
+fn after_deadline(t: &Setup) {
+    t.env.ledger().with_mut(|l| l.timestamp += HOUR + 1);
 }
 
 #[test]
-fn test_initialize() {
+fn create_locks_the_reward_in_escrow() {
     let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let contract_id = env.register(EscrowServiceContract, ());
-    let client = EscrowServiceContractClient::new(&env, &contract_id);
-
-    client.initialize(&admin);
-
-    assert_eq!(client.get_admin(), admin);
-    assert!(!client.is_paused());
-    assert_eq!(client.get_escrow_count(), 0);
+    let t = setup(&env);
+    let id = create(&t, 3);
+    assert_eq!(id, 1);
+    assert_eq!(t.client.get_bounty_count(), 1);
+    assert_eq!(t.token.balance(&t.client.address), REWARD);
+    let b = t.client.get_bounty(&id);
+    assert_eq!(b.status, BountyStatus::Open);
+    assert_eq!(b.creator, t.creator);
+    assert_eq!(b.reward_amount, REWARD);
 }
 
 #[test]
-#[should_panic]
-fn test_double_initialize_fails() {
+fn create_validates_inputs() {
     let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let contract_id = env.register(EscrowServiceContract, ());
-    let client = EscrowServiceContractClient::new(&env, &contract_id);
-
-    client.initialize(&admin);
-    client.initialize(&admin);
+    let t = setup(&env);
+    let now = t.env.ledger().timestamp();
+    let title = s(t.env, "t");
+    let desc = s(t.env, "d");
+    let tok = &t.token.address;
+    let c = &t.creator;
+    assert_eq!(
+        t.client
+            .try_create_bounty(c, tok, &title, &desc, &0, &(now + HOUR), &1),
+        Err(Ok(Error::InvalidReward))
+    );
+    assert_eq!(
+        t.client
+            .try_create_bounty(c, tok, &title, &desc, &REWARD, &now, &1),
+        Err(Ok(Error::DeadlineNotInFuture))
+    );
+    assert_eq!(
+        t.client
+            .try_create_bounty(c, tok, &title, &desc, &REWARD, &(now + HOUR), &0),
+        Err(Ok(Error::InvalidMaxParticipants))
+    );
+    assert_eq!(
+        t.client
+            .try_create_bounty(c, tok, &s(t.env, ""), &desc, &REWARD, &(now + HOUR), &1),
+        Err(Ok(Error::InvalidText))
+    );
 }
 
 #[test]
-fn test_create_escrow() {
+fn full_lifecycle_pays_the_winner() {
     let env = Env::default();
-    env.mock_all_auths();
+    let t = setup(&env);
+    let id = create(&t, 2);
+    let alice = Address::generate(t.env);
+    let bob = Address::generate(t.env);
 
-    let admin = Address::generate(&env);
-    let depositor = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
+    t.client.join_bounty(&id, &alice);
+    t.client.join_bounty(&id, &bob);
+    assert!(t.client.is_participant(&id, &alice));
+    t.client.submit_solution(&id, &alice, &hash(t.env, 1));
+    t.client.submit_solution(&id, &bob, &hash(t.env, 2));
+    assert_eq!(t.client.get_submission(&id, &alice), Some(hash(t.env, 1)));
 
-    let token_addr = env.register_stellar_asset_contract_v2(admin.clone()).address();
-
-    let contract_id = env.register(EscrowServiceContract, ());
-    let client = EscrowServiceContractClient::new(&env, &contract_id);
-    client.initialize(&admin);
-
-    let deadline = env.ledger().timestamp() + 3600;
-    let escrow_id = client.create_escrow(&depositor, &beneficiary, &token_addr, &1_000_000, &deadline);
-    assert_eq!(escrow_id, 1);
-    assert_eq!(client.get_escrow_count(), 1);
-
-    let escrow = client.get_escrow(&escrow_id);
-    assert_eq!(escrow.depositor, depositor);
-    assert_eq!(escrow.beneficiary, beneficiary);
-    assert_eq!(escrow.amount, 1_000_000);
-    assert_eq!(escrow.state, EscrowState::Created);
+    t.client.select_winner(&id, &alice);
+    assert_eq!(t.token.balance(&alice), REWARD);
+    assert_eq!(t.token.balance(&t.client.address), 0);
+    assert_eq!(t.client.get_winner(&id), Some(alice));
+    assert_eq!(t.client.get_bounty(&id).status, BountyStatus::Completed);
 }
 
 #[test]
-fn test_fund_and_release() {
+fn join_rules_match_the_cairo_contract() {
     let env = Env::default();
-    env.mock_all_auths();
+    let t = setup(&env);
+    let id = create(&t, 1);
+    let alice = Address::generate(t.env);
+    let bob = Address::generate(t.env);
 
-    let admin = Address::generate(&env);
-    let depositor = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-
-    let token_addr = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let asset_client = token::StellarAssetClient::new(&env, &token_addr);
-    asset_client.mint(&depositor, &10_000_000);
-
-    let contract_id = env.register(EscrowServiceContract, ());
-    let client = EscrowServiceContractClient::new(&env, &contract_id);
-    client.initialize(&admin);
-
-    let deadline = env.ledger().timestamp() + 3600;
-    let amount: i128 = 1_000_000;
-
-    let escrow_id = client.create_escrow(&depositor, &beneficiary, &token_addr, &amount, &deadline);
-    client.fund_escrow(&depositor, &escrow_id);
-
-    let escrow = client.get_escrow(&escrow_id);
-    assert_eq!(escrow.state, EscrowState::Funded);
-
-    client.release_funds(&depositor, &escrow_id);
-
-    let escrow = client.get_escrow(&escrow_id);
-    assert_eq!(escrow.state, EscrowState::Released);
-
-    let token_client = token::Client::new(&env, &token_addr);
-    assert_eq!(token_client.balance(&beneficiary), amount);
+    assert_eq!(
+        t.client.try_join_bounty(&id, &t.creator),
+        Err(Ok(Error::CreatorCannotJoin))
+    );
+    t.client.join_bounty(&id, &alice);
+    assert_eq!(
+        t.client.try_join_bounty(&id, &alice),
+        Err(Ok(Error::AlreadyJoined))
+    );
+    assert_eq!(
+        t.client.try_join_bounty(&id, &bob),
+        Err(Ok(Error::BountyFull))
+    );
+    assert_eq!(
+        t.client.try_join_bounty(&99, &bob),
+        Err(Ok(Error::BountyNotFound))
+    );
 }
 
 #[test]
-fn test_refund_after_deadline() {
+fn submissions_need_a_participant_before_the_deadline() {
     let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let depositor = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-
-    let token_addr = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let asset_client = token::StellarAssetClient::new(&env, &token_addr);
-    asset_client.mint(&depositor, &10_000_000);
-
-    let contract_id = env.register(EscrowServiceContract, ());
-    let client = EscrowServiceContractClient::new(&env, &contract_id);
-    client.initialize(&admin);
-
-    let initial_balance = token::Client::new(&env, &token_addr).balance(&depositor);
-    let deadline = env.ledger().timestamp() + 3600;
-    let amount: i128 = 1_000_000;
-
-    let escrow_id = client.create_escrow(&depositor, &beneficiary, &token_addr, &amount, &deadline);
-    client.fund_escrow(&depositor, &escrow_id);
-
-    advance_time(&env, 7200);
-    client.refund(&depositor, &escrow_id);
-
-    let escrow = client.get_escrow(&escrow_id);
-    assert_eq!(escrow.state, EscrowState::Refunded);
-
-    let token_client = token::Client::new(&env, &token_addr);
-    assert_eq!(token_client.balance(&depositor), initial_balance);
+    let t = setup(&env);
+    let id = create(&t, 2);
+    let alice = Address::generate(t.env);
+    assert_eq!(
+        t.client.try_submit_solution(&id, &alice, &hash(t.env, 1)),
+        Err(Ok(Error::NotParticipant))
+    );
+    t.client.join_bounty(&id, &alice);
+    after_deadline(&t);
+    assert_eq!(
+        t.client.try_submit_solution(&id, &alice, &hash(t.env, 1)),
+        Err(Ok(Error::DeadlinePassed))
+    );
 }
 
 #[test]
-#[should_panic]
-fn test_refund_before_deadline_fails() {
+fn winner_must_have_submitted() {
     let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let depositor = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-
-    let token_addr = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let asset_client = token::StellarAssetClient::new(&env, &token_addr);
-    asset_client.mint(&depositor, &10_000_000);
-
-    let contract_id = env.register(EscrowServiceContract, ());
-    let client = EscrowServiceContractClient::new(&env, &contract_id);
-    client.initialize(&admin);
-
-    let deadline = env.ledger().timestamp() + 3600;
-    let escrow_id = client.create_escrow(&depositor, &beneficiary, &token_addr, &1_000_000, &deadline);
-    client.fund_escrow(&depositor, &escrow_id);
-
-    // Deadline not passed — should panic
-    client.refund(&depositor, &escrow_id);
+    let t = setup(&env);
+    let id = create(&t, 2);
+    let alice = Address::generate(t.env);
+    t.client.join_bounty(&id, &alice);
+    assert_eq!(
+        t.client.try_select_winner(&id, &alice),
+        Err(Ok(Error::NoSubmission))
+    );
 }
 
 #[test]
-fn test_dispute_and_resolve_to_beneficiary() {
+fn resubmitting_counts_once() {
     let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let depositor = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-
-    let token_addr = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let asset_client = token::StellarAssetClient::new(&env, &token_addr);
-    asset_client.mint(&depositor, &10_000_000);
-
-    let contract_id = env.register(EscrowServiceContract, ());
-    let client = EscrowServiceContractClient::new(&env, &contract_id);
-    client.initialize(&admin);
-
-    let amount: i128 = 1_000_000;
-    let deadline = env.ledger().timestamp() + 3600;
-
-    let escrow_id = client.create_escrow(&depositor, &beneficiary, &token_addr, &amount, &deadline);
-    client.fund_escrow(&depositor, &escrow_id);
-    client.raise_dispute(&depositor, &escrow_id);
-
-    let escrow = client.get_escrow(&escrow_id);
-    assert_eq!(escrow.state, EscrowState::Disputed);
-
-    client.resolve_dispute(&admin, &escrow_id, &true);
-
-    let escrow = client.get_escrow(&escrow_id);
-    assert_eq!(escrow.state, EscrowState::Released);
-
-    let token_client = token::Client::new(&env, &token_addr);
-    assert_eq!(token_client.balance(&beneficiary), amount);
+    let t = setup(&env);
+    let id = create(&t, 2);
+    let alice = Address::generate(t.env);
+    t.client.join_bounty(&id, &alice);
+    t.client.submit_solution(&id, &alice, &hash(t.env, 1));
+    t.client.submit_solution(&id, &alice, &hash(t.env, 2));
+    assert_eq!(t.client.get_bounty(&id).submission_count, 1);
+    assert_eq!(t.client.get_submission(&id, &alice), Some(hash(t.env, 2)));
 }
 
 #[test]
-fn test_dispute_resolve_to_depositor() {
+fn refund_after_deadline_only_without_submissions() {
     let env = Env::default();
-    env.mock_all_auths();
+    let t = setup(&env);
+    let id = create(&t, 2);
+    let before = t.token.balance(&t.creator);
+    assert_eq!(t.client.try_refund(&id), Err(Ok(Error::DeadlineNotPassed)));
+    after_deadline(&t);
+    t.client.refund(&id);
+    assert_eq!(t.token.balance(&t.creator), before + REWARD);
+    assert_eq!(t.client.get_bounty(&id).status, BountyStatus::Refunded);
 
-    let admin = Address::generate(&env);
-    let depositor = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-
-    let token_addr = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let asset_client = token::StellarAssetClient::new(&env, &token_addr);
-    asset_client.mint(&depositor, &10_000_000);
-
-    let contract_id = env.register(EscrowServiceContract, ());
-    let client = EscrowServiceContractClient::new(&env, &contract_id);
-    client.initialize(&admin);
-
-    let initial_balance = token::Client::new(&env, &token_addr).balance(&depositor);
-    let amount: i128 = 1_000_000;
-    let deadline = env.ledger().timestamp() + 3600;
-
-    let escrow_id = client.create_escrow(&depositor, &beneficiary, &token_addr, &amount, &deadline);
-    client.fund_escrow(&depositor, &escrow_id);
-    client.raise_dispute(&beneficiary, &escrow_id);
-    client.resolve_dispute(&admin, &escrow_id, &false);
-
-    let token_client = token::Client::new(&env, &token_addr);
-    assert_eq!(token_client.balance(&depositor), initial_balance);
+    let id2 = create(&t, 2);
+    let alice = Address::generate(t.env);
+    t.client.join_bounty(&id2, &alice);
+    t.client.submit_solution(&id2, &alice, &hash(t.env, 1));
+    after_deadline(&t);
+    assert_eq!(t.client.try_refund(&id2), Err(Ok(Error::HasSubmissions)));
 }
 
 #[test]
-fn test_cancel_unfunded_escrow() {
+fn cancel_only_before_anyone_joins() {
     let env = Env::default();
-    env.mock_all_auths();
+    let t = setup(&env);
+    let id = create(&t, 2);
+    t.client.cancel_bounty(&id);
+    assert_eq!(t.client.get_bounty(&id).status, BountyStatus::Cancelled);
+    assert_eq!(t.token.balance(&t.client.address), 0);
 
-    let admin = Address::generate(&env);
-    let depositor = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-
-    let token_addr = env.register_stellar_asset_contract_v2(admin.clone()).address();
-
-    let contract_id = env.register(EscrowServiceContract, ());
-    let client = EscrowServiceContractClient::new(&env, &contract_id);
-    client.initialize(&admin);
-
-    let deadline = env.ledger().timestamp() + 3600;
-    let escrow_id = client.create_escrow(&depositor, &beneficiary, &token_addr, &1_000_000, &deadline);
-    client.cancel_escrow(&depositor, &escrow_id);
-
-    let escrow = client.get_escrow(&escrow_id);
-    assert_eq!(escrow.state, EscrowState::Cancelled);
+    let id2 = create(&t, 2);
+    t.client.join_bounty(&id2, &Address::generate(t.env));
+    assert_eq!(
+        t.client.try_cancel_bounty(&id2),
+        Err(Ok(Error::HasParticipants))
+    );
 }
 
 #[test]
-fn test_pause_prevents_create() {
+fn dispute_lets_the_admin_pay_a_submitter() {
     let env = Env::default();
-    env.mock_all_auths();
+    let t = setup(&env);
+    let id = create(&t, 2);
+    let alice = Address::generate(t.env);
+    t.client.join_bounty(&id, &alice);
+    t.client.submit_solution(&id, &alice, &hash(t.env, 1));
 
-    let admin = Address::generate(&env);
-    let depositor = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
+    assert_eq!(
+        t.client.try_raise_dispute(&id, &alice),
+        Err(Ok(Error::DeadlineNotPassed))
+    );
+    after_deadline(&t);
+    t.client.raise_dispute(&id, &alice);
+    assert_eq!(t.client.get_bounty(&id).status, BountyStatus::Disputed);
+    // Creator can't refund or pick a winner while disputed.
+    assert_eq!(
+        t.client.try_select_winner(&id, &alice),
+        Err(Ok(Error::BountyNotOpen))
+    );
 
-    let token_addr = env.register_stellar_asset_contract_v2(admin.clone()).address();
-
-    let contract_id = env.register(EscrowServiceContract, ());
-    let client = EscrowServiceContractClient::new(&env, &contract_id);
-    client.initialize(&admin);
-
-    client.pause(&admin);
-    assert!(client.is_paused());
-
-    let deadline = env.ledger().timestamp() + 3600;
-    let result = client.try_create_escrow(&depositor, &beneficiary, &token_addr, &1_000_000, &deadline);
-    assert!(result.is_err());
-
-    client.unpause(&admin);
-    assert!(!client.is_paused());
+    t.client.resolve_dispute(&id, &Some(alice.clone()));
+    assert_eq!(t.token.balance(&alice), REWARD);
+    assert_eq!(t.client.get_winner(&id), Some(alice));
 }
 
 #[test]
-#[should_panic]
-fn test_invalid_amount_fails() {
+fn dispute_can_return_the_reward_to_the_creator() {
     let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let depositor = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-    let token_addr = env.register_stellar_asset_contract_v2(admin.clone()).address();
-
-    let contract_id = env.register(EscrowServiceContract, ());
-    let client = EscrowServiceContractClient::new(&env, &contract_id);
-    client.initialize(&admin);
-
-    let deadline = env.ledger().timestamp() + 3600;
-    client.create_escrow(&depositor, &beneficiary, &token_addr, &0, &deadline);
+    let t = setup(&env);
+    let id = create(&t, 2);
+    let alice = Address::generate(t.env);
+    t.client.join_bounty(&id, &alice);
+    t.client.submit_solution(&id, &alice, &hash(t.env, 1));
+    after_deadline(&t);
+    t.client.raise_dispute(&id, &alice);
+    let before = t.token.balance(&t.creator);
+    t.client.resolve_dispute(&id, &None);
+    assert_eq!(t.token.balance(&t.creator), before + REWARD);
+    assert_eq!(t.client.get_bounty(&id).status, BountyStatus::Refunded);
 }
 
 #[test]
-#[should_panic]
-fn test_non_depositor_cannot_release() {
+fn pause_blocks_new_activity_but_not_refunds() {
     let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let depositor = Address::generate(&env);
-    let beneficiary = Address::generate(&env);
-
-    let token_addr = env.register_stellar_asset_contract_v2(admin.clone()).address();
-    let asset_client = token::StellarAssetClient::new(&env, &token_addr);
-    asset_client.mint(&depositor, &10_000_000);
-
-    let contract_id = env.register(EscrowServiceContract, ());
-    let client = EscrowServiceContractClient::new(&env, &contract_id);
-    client.initialize(&admin);
-
-    let deadline = env.ledger().timestamp() + 3600;
-    let escrow_id = client.create_escrow(&depositor, &beneficiary, &token_addr, &1_000_000, &deadline);
-    client.fund_escrow(&depositor, &escrow_id);
-
-    // beneficiary tries to release — should panic
-    client.release_funds(&beneficiary, &escrow_id);
+    let t = setup(&env);
+    let id = create(&t, 2);
+    t.client.set_paused(&true);
+    assert!(t.client.is_paused());
+    let now = t.env.ledger().timestamp();
+    assert_eq!(
+        t.client.try_create_bounty(
+            &t.creator,
+            &t.token.address,
+            &s(t.env, "t"),
+            &s(t.env, "d"),
+            &REWARD,
+            &(now + HOUR),
+            &1
+        ),
+        Err(Ok(Error::ContractPaused))
+    );
+    assert_eq!(
+        t.client.try_join_bounty(&id, &Address::generate(t.env)),
+        Err(Ok(Error::ContractPaused))
+    );
+    t.client.cancel_bounty(&id);
+    assert_eq!(t.client.get_admin(), t.admin);
 }
