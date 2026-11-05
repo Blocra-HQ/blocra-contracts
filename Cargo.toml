@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["bounty"]
+members = ["report_registry"]
 
 # Same lint policy as the stellar-insights contract workspace this layout comes from.
 [workspace.lints.clippy]
