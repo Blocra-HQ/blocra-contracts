@@ -4,42 +4,27 @@
 #![allow(clippy::panic)]
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    token::{Client as TokenClient, StellarAssetClient},
+    testutils::{storage::Persistent as _, Address as _, Ledger},
     Address, BytesN, Env, String,
 };
 
-use crate::{BountyContract, BountyContractClient, BountyStatus, Error};
-
-const REWARD: i128 = 5_000_000;
-const HOUR: u64 = 3_600;
+use crate::{DataKey, Error, ReportRegistry, ReportRegistryClient};
 
 struct Setup<'a> {
     env: &'a Env,
-    client: BountyContractClient<'a>,
-    token: TokenClient<'a>,
+    client: ReportRegistryClient<'a>,
     admin: Address,
-    creator: Address,
 }
 
 fn setup(env: &Env) -> Setup<'_> {
     env.mock_all_auths();
     env.ledger().with_mut(|l| l.timestamp = 1_000_000);
-
     let admin = Address::generate(env);
-    let creator = Address::generate(env);
-    let token_id = env
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
-    StellarAssetClient::new(env, &token_id).mint(&creator, &(REWARD * 10));
-
-    let id = env.register(BountyContract, (admin.clone(),));
+    let id = env.register(ReportRegistry, (admin.clone(),));
     Setup {
         env,
-        client: BountyContractClient::new(env, &id),
-        token: TokenClient::new(env, &token_id),
+        client: ReportRegistryClient::new(env, &id),
         admin,
-        creator,
     }
 }
 
@@ -51,265 +36,181 @@ fn hash(env: &Env, b: u8) -> BytesN<32> {
     BytesN::from_array(env, &[b; 32])
 }
 
-fn create(t: &Setup, max_participants: u32) -> u64 {
-    let deadline = t.env.ledger().timestamp() + HOUR;
-    t.client.create_bounty(
-        &t.creator,
-        &t.token.address,
-        &s(t.env, "Top DEX by volume"),
-        &s(t.env, "Rank Stellar DEX pairs by 30-day volume"),
-        &REWARD,
-        &deadline,
-        &max_participants,
+fn publish(t: &Setup, author: &Address, b: u8) -> u64 {
+    t.client.publish_report(
+        author,
+        &hash(t.env, b),
+        &s(t.env, "USDC transfer activity, Q4"),
+        &s(t.env, "starknet"),
+        &s(
+            t.env,
+            "0x053c91253bc9682c04929ca02ed00b3e423f6710d2ee7e0d5ebb06f3ecf368a8",
+        ),
+        &None,
     )
 }
 
-fn after_deadline(t: &Setup) {
-    t.env.ledger().with_mut(|l| l.timestamp += HOUR + 1);
-}
-
 #[test]
-fn create_locks_the_reward_in_escrow() {
+fn publish_and_verify() {
     let env = Env::default();
     let t = setup(&env);
-    let id = create(&t, 3);
+    let alice = Address::generate(&env);
+
+    let id = publish(&t, &alice, 1);
     assert_eq!(id, 1);
-    assert_eq!(t.client.get_bounty_count(), 1);
-    assert_eq!(t.token.balance(&t.client.address), REWARD);
-    let b = t.client.get_bounty(&id);
-    assert_eq!(b.status, BountyStatus::Open);
-    assert_eq!(b.creator, t.creator);
-    assert_eq!(b.reward_amount, REWARD);
+    assert_eq!(t.client.get_report_count(), 1);
+    assert!(t.client.verify(&hash(&env, 1)));
+    assert!(!t.client.verify(&hash(&env, 2)));
+
+    let r = t.client.get_report(&id);
+    assert_eq!(r.author, alice);
+    assert_eq!(r.chain, s(&env, "starknet"));
+    assert_eq!(r.published_at, 1_000_000);
+    assert!(!r.revoked);
+    assert_eq!(t.client.get_report_by_hash(&hash(&env, 1)), Some(r));
+    assert_eq!(t.client.get_report_by_hash(&hash(&env, 9)), None);
 }
 
 #[test]
-fn create_validates_inputs() {
+fn a_hash_can_only_be_published_once() {
     let env = Env::default();
     let t = setup(&env);
-    let now = t.env.ledger().timestamp();
-    let title = s(t.env, "t");
-    let desc = s(t.env, "d");
-    let tok = &t.token.address;
-    let c = &t.creator;
+    let alice = Address::generate(&env);
+    let mallory = Address::generate(&env);
+    publish(&t, &alice, 1);
+    let again = t.client.try_publish_report(
+        &mallory,
+        &hash(&env, 1),
+        &s(&env, "Stolen"),
+        &s(&env, "starknet"),
+        &s(&env, "0x1"),
+        &None,
+    );
+    assert_eq!(again, Err(Ok(Error::AlreadyPublished)));
     assert_eq!(
+        t.client.get_report_by_hash(&hash(&env, 1)).unwrap().author,
+        alice
+    );
+}
+
+#[test]
+fn validates_text_fields() {
+    let env = Env::default();
+    let t = setup(&env);
+    let a = Address::generate(&env);
+    let long = String::from_str(&env, &"x".repeat(300));
+    let try_pub = |title: &String, chain: &String, uri: &Option<String>| {
         t.client
-            .try_create_bounty(c, tok, &title, &desc, &0, &(now + HOUR), &1),
-        Err(Ok(Error::InvalidReward))
+            .try_publish_report(&a, &hash(&env, 1), title, chain, &s(&env, "0x1"), uri)
+    };
+    assert_eq!(
+        try_pub(&s(&env, ""), &s(&env, "base"), &None),
+        Err(Ok(Error::InvalidText))
     );
     assert_eq!(
-        t.client
-            .try_create_bounty(c, tok, &title, &desc, &REWARD, &now, &1),
-        Err(Ok(Error::DeadlineNotInFuture))
+        try_pub(&s(&env, "t"), &long, &None),
+        Err(Ok(Error::InvalidText))
     );
     assert_eq!(
-        t.client
-            .try_create_bounty(c, tok, &title, &desc, &REWARD, &(now + HOUR), &0),
-        Err(Ok(Error::InvalidMaxParticipants))
-    );
-    assert_eq!(
-        t.client
-            .try_create_bounty(c, tok, &s(t.env, ""), &desc, &REWARD, &(now + HOUR), &1),
+        try_pub(&s(&env, "t"), &s(&env, "base"), &Some(long.clone())),
         Err(Ok(Error::InvalidText))
     );
 }
 
 #[test]
-fn full_lifecycle_pays_the_winner() {
+fn revoke_keeps_the_record_but_fails_verification() {
     let env = Env::default();
     let t = setup(&env);
-    let id = create(&t, 2);
-    let alice = Address::generate(t.env);
-    let bob = Address::generate(t.env);
-
-    t.client.join_bounty(&id, &alice);
-    t.client.join_bounty(&id, &bob);
-    assert!(t.client.is_participant(&id, &alice));
-    t.client.submit_solution(&id, &alice, &hash(t.env, 1));
-    t.client.submit_solution(&id, &bob, &hash(t.env, 2));
-    assert_eq!(t.client.get_submission(&id, &alice), Some(hash(t.env, 1)));
-
-    t.client.select_winner(&id, &alice);
-    assert_eq!(t.token.balance(&alice), REWARD);
-    assert_eq!(t.token.balance(&t.client.address), 0);
-    assert_eq!(t.client.get_winner(&id), Some(alice));
-    assert_eq!(t.client.get_bounty(&id).status, BountyStatus::Completed);
-}
-
-#[test]
-fn join_rules_match_the_cairo_contract() {
-    let env = Env::default();
-    let t = setup(&env);
-    let id = create(&t, 1);
-    let alice = Address::generate(t.env);
-    let bob = Address::generate(t.env);
-
+    let alice = Address::generate(&env);
+    let id = publish(&t, &alice, 1);
+    t.client.revoke_report(&id);
+    assert!(!t.client.verify(&hash(&env, 1)));
+    assert!(t.client.get_report(&id).revoked);
     assert_eq!(
-        t.client.try_join_bounty(&id, &t.creator),
-        Err(Ok(Error::CreatorCannotJoin))
-    );
-    t.client.join_bounty(&id, &alice);
-    assert_eq!(
-        t.client.try_join_bounty(&id, &alice),
-        Err(Ok(Error::AlreadyJoined))
+        t.client.try_revoke_report(&id),
+        Err(Ok(Error::AlreadyRevoked))
     );
     assert_eq!(
-        t.client.try_join_bounty(&id, &bob),
-        Err(Ok(Error::BountyFull))
-    );
-    assert_eq!(
-        t.client.try_join_bounty(&99, &bob),
-        Err(Ok(Error::BountyNotFound))
+        t.client.try_revoke_report(&99),
+        Err(Ok(Error::ReportNotFound))
     );
 }
 
 #[test]
-fn submissions_need_a_participant_before_the_deadline() {
+fn pages_all_reports_and_per_author() {
     let env = Env::default();
     let t = setup(&env);
-    let id = create(&t, 2);
-    let alice = Address::generate(t.env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    for b in 1..=3 {
+        publish(&t, &alice, b);
+    }
+    publish(&t, &bob, 10);
+
+    let all = t.client.get_reports(&1, &10);
+    assert_eq!(all.len(), 4);
+    assert_eq!(t.client.get_reports(&0, &2).len(), 2);
+    assert_eq!(t.client.get_reports(&5, &10).len(), 0);
     assert_eq!(
-        t.client.try_submit_solution(&id, &alice, &hash(t.env, 1)),
-        Err(Ok(Error::NotParticipant))
+        t.client.try_get_reports(&1, &0),
+        Err(Ok(Error::InvalidPageSize))
     );
-    t.client.join_bounty(&id, &alice);
-    after_deadline(&t);
     assert_eq!(
-        t.client.try_submit_solution(&id, &alice, &hash(t.env, 1)),
-        Err(Ok(Error::DeadlinePassed))
+        t.client.try_get_reports(&1, &51),
+        Err(Ok(Error::InvalidPageSize))
     );
-}
 
-#[test]
-fn winner_must_have_submitted() {
-    let env = Env::default();
-    let t = setup(&env);
-    let id = create(&t, 2);
-    let alice = Address::generate(t.env);
-    t.client.join_bounty(&id, &alice);
+    assert_eq!(t.client.get_author_report_count(&alice), 3);
+    let mine = t.client.get_author_reports(&alice, &1, &10);
+    assert_eq!(mine.len(), 2);
+    assert_eq!(mine.get(0).unwrap().id, 2);
     assert_eq!(
-        t.client.try_select_winner(&id, &alice),
-        Err(Ok(Error::NoSubmission))
-    );
-}
-
-#[test]
-fn resubmitting_counts_once() {
-    let env = Env::default();
-    let t = setup(&env);
-    let id = create(&t, 2);
-    let alice = Address::generate(t.env);
-    t.client.join_bounty(&id, &alice);
-    t.client.submit_solution(&id, &alice, &hash(t.env, 1));
-    t.client.submit_solution(&id, &alice, &hash(t.env, 2));
-    assert_eq!(t.client.get_bounty(&id).submission_count, 1);
-    assert_eq!(t.client.get_submission(&id, &alice), Some(hash(t.env, 2)));
-}
-
-#[test]
-fn refund_after_deadline_only_without_submissions() {
-    let env = Env::default();
-    let t = setup(&env);
-    let id = create(&t, 2);
-    let before = t.token.balance(&t.creator);
-    assert_eq!(t.client.try_refund(&id), Err(Ok(Error::DeadlineNotPassed)));
-    after_deadline(&t);
-    t.client.refund(&id);
-    assert_eq!(t.token.balance(&t.creator), before + REWARD);
-    assert_eq!(t.client.get_bounty(&id).status, BountyStatus::Refunded);
-
-    let id2 = create(&t, 2);
-    let alice = Address::generate(t.env);
-    t.client.join_bounty(&id2, &alice);
-    t.client.submit_solution(&id2, &alice, &hash(t.env, 1));
-    after_deadline(&t);
-    assert_eq!(t.client.try_refund(&id2), Err(Ok(Error::HasSubmissions)));
-}
-
-#[test]
-fn cancel_only_before_anyone_joins() {
-    let env = Env::default();
-    let t = setup(&env);
-    let id = create(&t, 2);
-    t.client.cancel_bounty(&id);
-    assert_eq!(t.client.get_bounty(&id).status, BountyStatus::Cancelled);
-    assert_eq!(t.token.balance(&t.client.address), 0);
-
-    let id2 = create(&t, 2);
-    t.client.join_bounty(&id2, &Address::generate(t.env));
-    assert_eq!(
-        t.client.try_cancel_bounty(&id2),
-        Err(Ok(Error::HasParticipants))
+        t.client
+            .get_author_reports(&bob, &0, &10)
+            .get(0)
+            .unwrap()
+            .id,
+        4
     );
 }
 
 #[test]
-fn dispute_lets_the_admin_pay_a_submitter() {
+fn records_live_for_the_network_maximum() {
     let env = Env::default();
     let t = setup(&env);
-    let id = create(&t, 2);
-    let alice = Address::generate(t.env);
-    t.client.join_bounty(&id, &alice);
-    t.client.submit_solution(&id, &alice, &hash(t.env, 1));
-
-    assert_eq!(
-        t.client.try_raise_dispute(&id, &alice),
-        Err(Ok(Error::DeadlineNotPassed))
-    );
-    after_deadline(&t);
-    t.client.raise_dispute(&id, &alice);
-    assert_eq!(t.client.get_bounty(&id).status, BountyStatus::Disputed);
-    // Creator can't refund or pick a winner while disputed.
-    assert_eq!(
-        t.client.try_select_winner(&id, &alice),
-        Err(Ok(Error::BountyNotOpen))
-    );
-
-    t.client.resolve_dispute(&id, &Some(alice.clone()));
-    assert_eq!(t.token.balance(&alice), REWARD);
-    assert_eq!(t.client.get_winner(&id), Some(alice));
+    let id = publish(&t, &Address::generate(&env), 1);
+    env.as_contract(&t.client.address, || {
+        let max = env.storage().max_ttl();
+        assert_eq!(
+            env.storage().persistent().get_ttl(&DataKey::Report(id)),
+            max
+        );
+        assert_eq!(
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::HashIndex(hash(&env, 1))),
+            max
+        );
+    });
 }
 
 #[test]
-fn dispute_can_return_the_reward_to_the_creator() {
+fn pause_blocks_publishing_only() {
     let env = Env::default();
     let t = setup(&env);
-    let id = create(&t, 2);
-    let alice = Address::generate(t.env);
-    t.client.join_bounty(&id, &alice);
-    t.client.submit_solution(&id, &alice, &hash(t.env, 1));
-    after_deadline(&t);
-    t.client.raise_dispute(&id, &alice);
-    let before = t.token.balance(&t.creator);
-    t.client.resolve_dispute(&id, &None);
-    assert_eq!(t.token.balance(&t.creator), before + REWARD);
-    assert_eq!(t.client.get_bounty(&id).status, BountyStatus::Refunded);
-}
-
-#[test]
-fn pause_blocks_new_activity_but_not_refunds() {
-    let env = Env::default();
-    let t = setup(&env);
-    let id = create(&t, 2);
+    let alice = Address::generate(&env);
+    let id = publish(&t, &alice, 1);
     t.client.set_paused(&true);
     assert!(t.client.is_paused());
-    let now = t.env.ledger().timestamp();
-    assert_eq!(
-        t.client.try_create_bounty(
-            &t.creator,
-            &t.token.address,
-            &s(t.env, "t"),
-            &s(t.env, "d"),
-            &REWARD,
-            &(now + HOUR),
-            &1
-        ),
-        Err(Ok(Error::ContractPaused))
+    let paused = t.client.try_publish_report(
+        &alice,
+        &hash(&env, 2),
+        &s(&env, "t"),
+        &s(&env, "base"),
+        &s(&env, "0x1"),
+        &None,
     );
-    assert_eq!(
-        t.client.try_join_bounty(&id, &Address::generate(t.env)),
-        Err(Ok(Error::ContractPaused))
-    );
-    t.client.cancel_bounty(&id);
+    assert_eq!(paused, Err(Ok(Error::ContractPaused)));
+    t.client.revoke_report(&id);
     assert_eq!(t.client.get_admin(), t.admin);
 }

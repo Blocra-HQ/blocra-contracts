@@ -1,13 +1,14 @@
 #![no_std]
-//! BlocRA bounty contract (Soroban).
+//! BlocRA report registry (Soroban).
 //!
-//! Port of the original Cairo `BountyContract` (tag `cairo-starknet-v0`) with
-//! the same lifecycle: create → join → submit solution → select winner. Unlike
-//! the Cairo version, which only recorded `reward_amount`, the reward is held
-//! in escrow by this contract from creation until it is paid to the winner or
-//! returned to the creator. The escrow mechanics (checks-effects-interactions,
-//! reentrancy lock, TTL extension, pause, admin dispute resolution) come from
-//! the stellar-insights escrow contract this crate was built from.
+//! When an analyst generates a contract-analysis report in BlocRA, the app
+//! hashes the file (sha256) and publishes the hash here with the author, the
+//! chain and contract the report is about, and a title. Anyone holding a copy
+//! can recompute its hash and call `verify` / `get_report_by_hash` to confirm
+//! it is an unmodified BlocRA report, who published it and when.
+//!
+//! Built from the bounty/escrow crate (see git history): same constructor-set
+//! admin, typed errors, events keyed by id, TTL handling and pause switch.
 
 mod errors;
 // Events use publish(); soroban-sdk 29 prefers #[contractevent] (a later migration).
@@ -16,7 +17,7 @@ mod events;
 
 pub use errors::Error;
 use events::*;
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, String};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Vec};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -24,48 +25,33 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DAY_IN_LEDGERS: u32 = 17_280;
 const INSTANCE_TTL_EXTEND: u32 = 30 * DAY_IN_LEDGERS;
 const INSTANCE_TTL_THRESHOLD: u32 = INSTANCE_TTL_EXTEND - DAY_IN_LEDGERS;
-const RECORD_TTL_EXTEND: u32 = 90 * DAY_IN_LEDGERS;
-const RECORD_TTL_THRESHOLD: u32 = RECORD_TTL_EXTEND - DAY_IN_LEDGERS;
 
-pub const MAX_TITLE_LEN: u32 = 100;
-pub const MAX_DESCRIPTION_LEN: u32 = 2_000;
+pub const MAX_TITLE_LEN: u32 = 120;
+pub const MAX_CHAIN_LEN: u32 = 32;
+pub const MAX_SUBJECT_LEN: u32 = 128;
+pub const MAX_URI_LEN: u32 = 256;
+/// Largest page `get_reports` / `get_author_reports` return.
+pub const MAX_PAGE_SIZE: u32 = 50;
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
 #[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum BountyStatus {
-    /// Accepting participants and solutions; reward held in escrow.
-    Open = 0,
-    /// Winner selected and paid.
-    Completed = 1,
-    /// Deadline passed with no submissions; reward returned to the creator.
-    Refunded = 2,
-    /// Cancelled by the creator before anyone joined; reward returned.
-    Cancelled = 3,
-    /// A participant disputed it; waiting for the admin.
-    Disputed = 4,
-}
-
-#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Bounty {
+pub struct Report {
     pub id: u64,
-    pub creator: Address,
+    pub author: Address,
+    /// sha256 of the report file exactly as downloaded.
+    pub report_hash: BytesN<32>,
     pub title: String,
-    pub description: String,
-    /// Token the reward is paid in (e.g. the USDC or XLM Stellar Asset Contract).
-    pub token: Address,
-    pub reward_amount: i128,
-    /// Unix timestamp; solutions must be submitted by then.
-    pub deadline: u64,
-    pub status: BountyStatus,
-    pub max_participants: u32,
-    pub current_participants: u32,
-    pub submission_count: u32,
-    pub winner: Option<Address>,
-    pub created_at: u64,
+    /// Chain the analyzed contract lives on (BlocRA chain id, e.g. "starknet").
+    pub chain: String,
+    /// The analyzed contract's address.
+    pub subject: String,
+    /// Optional place to fetch the report from (https://, ipfs://).
+    pub uri: Option<String>,
+    pub published_at: u64,
+    /// Set by the author if the report turns out to be wrong. Kept on record.
+    pub revoked: bool,
 }
 
 #[contracttype]
@@ -73,11 +59,11 @@ pub struct Bounty {
 enum DataKey {
     Admin,
     Paused,
-    Locked,
-    BountyCount,
-    Bounty(u64),
-    Participant(u64, Address),
-    Submission(u64, Address),
+    ReportCount,
+    Report(u64),
+    HashIndex(BytesN<32>),
+    AuthorCount(Address),
+    AuthorReport(Address, u64),
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -88,10 +74,17 @@ fn bump_instance(env: &Env) {
         .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
 }
 
+/// Published reports are meant to be permanent: extend to the network max.
 fn bump_record(env: &Env, key: &DataKey) {
+    let max = env.storage().max_ttl();
     env.storage()
         .persistent()
-        .extend_ttl(key, RECORD_TTL_THRESHOLD, RECORD_TTL_EXTEND);
+        .extend_ttl(key, max.saturating_sub(DAY_IN_LEDGERS), max);
+}
+
+fn set_record<V: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &DataKey, value: &V) {
+    env.storage().persistent().set(key, value);
+    bump_record(env, key);
 }
 
 fn admin(env: &Env) -> Result<Address, Error> {
@@ -101,52 +94,6 @@ fn admin(env: &Env) -> Result<Address, Error> {
         .ok_or(Error::Unauthorized)
 }
 
-fn require_not_paused(env: &Env) -> Result<(), Error> {
-    if env
-        .storage()
-        .instance()
-        .get(&DataKey::Paused)
-        .unwrap_or(false)
-    {
-        return Err(Error::ContractPaused);
-    }
-    Ok(())
-}
-
-fn require_not_locked(env: &Env) -> Result<(), Error> {
-    if env
-        .storage()
-        .instance()
-        .get(&DataKey::Locked)
-        .unwrap_or(false)
-    {
-        return Err(Error::Reentrancy);
-    }
-    Ok(())
-}
-
-fn load(env: &Env, bounty_id: u64) -> Result<Bounty, Error> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::Bounty(bounty_id))
-        .ok_or(Error::BountyNotFound)
-}
-
-fn save(env: &Env, bounty: &Bounty) {
-    let key = DataKey::Bounty(bounty.id);
-    env.storage().persistent().set(&key, bounty);
-    bump_record(env, &key);
-    bump_instance(env);
-}
-
-/// Token transfer out of escrow under the reentrancy lock. State must already
-/// be saved (checks-effects-interactions).
-fn pay_out(env: &Env, token: &Address, to: &Address, amount: i128) {
-    env.storage().instance().set(&DataKey::Locked, &true);
-    token::Client::new(env, token).transfer(&env.current_contract_address(), to, &amount);
-    env.storage().instance().set(&DataKey::Locked, &false);
-}
-
 fn check_text(s: &String, max: u32) -> Result<(), Error> {
     if s.is_empty() || s.len() > max {
         return Err(Error::InvalidText);
@@ -154,281 +101,110 @@ fn check_text(s: &String, max: u32) -> Result<(), Error> {
     Ok(())
 }
 
+fn check_page(limit: u32) -> Result<(), Error> {
+    if limit == 0 || limit > MAX_PAGE_SIZE {
+        return Err(Error::InvalidPageSize);
+    }
+    Ok(())
+}
+
+fn load(env: &Env, id: u64) -> Result<Report, Error> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Report(id))
+        .ok_or(Error::ReportNotFound)
+}
+
 // ── Contract ────────────────────────────────────────────────────────────────
 
 #[contract]
-pub struct BountyContract;
+pub struct ReportRegistry;
 
 #[contractimpl]
-impl BountyContract {
-    /// Runs once, atomically with deployment, so nobody can front-run an
-    /// `initialize` call to claim the admin role.
+impl ReportRegistry {
+    /// Runs once, atomically with deployment, so the admin can't be front-run.
     pub fn __constructor(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::BountyCount, &0u64);
+        env.storage().instance().set(&DataKey::ReportCount, &0u64);
         bump_instance(&env);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    /// Creates a bounty and locks `reward_amount` of `token` from the creator
-    /// into this contract.
-    pub fn create_bounty(
+    /// Publishes a report hash on behalf of `author`. Each hash can be
+    /// published once, so a report's first publisher is its author on record.
+    pub fn publish_report(
         env: Env,
-        creator: Address,
-        token: Address,
+        author: Address,
+        report_hash: BytesN<32>,
         title: String,
-        description: String,
-        reward_amount: i128,
-        deadline: u64,
-        max_participants: u32,
+        chain: String,
+        subject: String,
+        uri: Option<String>,
     ) -> Result<u64, Error> {
-        require_not_paused(&env)?;
-        require_not_locked(&env)?;
-        creator.require_auth();
+        if env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(Error::ContractPaused);
+        }
+        author.require_auth();
 
-        if reward_amount <= 0 {
-            return Err(Error::InvalidReward);
-        }
-        let now = env.ledger().timestamp();
-        if deadline <= now {
-            return Err(Error::DeadlineNotInFuture);
-        }
-        if max_participants == 0 {
-            return Err(Error::InvalidMaxParticipants);
-        }
         check_text(&title, MAX_TITLE_LEN)?;
-        check_text(&description, MAX_DESCRIPTION_LEN)?;
+        check_text(&chain, MAX_CHAIN_LEN)?;
+        check_text(&subject, MAX_SUBJECT_LEN)?;
+        if let Some(u) = &uri {
+            check_text(u, MAX_URI_LEN)?;
+        }
+        let hash_key = DataKey::HashIndex(report_hash.clone());
+        if env.storage().persistent().has(&hash_key) {
+            return Err(Error::AlreadyPublished);
+        }
 
-        let id = Self::get_bounty_count(env.clone())
+        let id = Self::get_report_count(env.clone())
             .checked_add(1)
             .ok_or(Error::IdOverflow)?;
-        let bounty = Bounty {
+        let report = Report {
             id,
-            creator: creator.clone(),
+            author: author.clone(),
+            report_hash: report_hash.clone(),
             title,
-            description,
-            token: token.clone(),
-            reward_amount,
-            deadline,
-            status: BountyStatus::Open,
-            max_participants,
-            current_participants: 0,
-            submission_count: 0,
-            winner: None,
-            created_at: now,
+            chain,
+            subject,
+            uri,
+            published_at: env.ledger().timestamp(),
+            revoked: false,
         };
-        env.storage().instance().set(&DataKey::BountyCount, &id);
-        save(&env, &bounty);
+        set_record(&env, &DataKey::Report(id), &report);
+        set_record(&env, &hash_key, &id);
 
-        env.storage().instance().set(&DataKey::Locked, &true);
-        token::Client::new(&env, &token).transfer(
-            &creator,
-            env.current_contract_address(),
-            &reward_amount,
-        );
-        env.storage().instance().set(&DataKey::Locked, &false);
+        let n = Self::get_author_report_count(env.clone(), author.clone());
+        set_record(&env, &DataKey::AuthorReport(author.clone(), n), &id);
+        set_record(&env, &DataKey::AuthorCount(author.clone()), &(n + 1));
 
-        emit_bounty_created(&env, id, creator, reward_amount);
+        env.storage().instance().set(&DataKey::ReportCount, &id);
+        bump_instance(&env);
+
+        emit_report_published(&env, id, author, report_hash);
         Ok(id)
     }
 
-    pub fn join_bounty(env: Env, bounty_id: u64, participant: Address) -> Result<(), Error> {
-        require_not_paused(&env)?;
-        participant.require_auth();
-        let mut bounty = load(&env, bounty_id)?;
-
-        if bounty.status != BountyStatus::Open {
-            return Err(Error::BountyNotOpen);
+    /// The author withdraws a report (e.g. it contained an error). The record
+    /// stays, marked revoked, so old copies can still be identified.
+    pub fn revoke_report(env: Env, id: u64) -> Result<(), Error> {
+        let mut report = load(&env, id)?;
+        report.author.require_auth();
+        if report.revoked {
+            return Err(Error::AlreadyRevoked);
         }
-        if env.ledger().timestamp() > bounty.deadline {
-            return Err(Error::DeadlinePassed);
-        }
-        if bounty.creator == participant {
-            return Err(Error::CreatorCannotJoin);
-        }
-        let key = DataKey::Participant(bounty_id, participant.clone());
-        if env.storage().persistent().has(&key) {
-            return Err(Error::AlreadyJoined);
-        }
-        if bounty.current_participants >= bounty.max_participants {
-            return Err(Error::BountyFull);
-        }
-
-        env.storage().persistent().set(&key, &true);
-        bump_record(&env, &key);
-        bounty.current_participants += 1;
-        save(&env, &bounty);
-
-        emit_participant_joined(&env, bounty_id, participant);
+        report.revoked = true;
+        set_record(&env, &DataKey::Report(id), &report);
+        bump_instance(&env);
+        emit_report_revoked(&env, id, report.author);
         Ok(())
     }
 
-    /// Records (or replaces) a participant's solution hash, e.g. the sha256 of
-    /// the analysis report or dashboard they built.
-    pub fn submit_solution(
-        env: Env,
-        bounty_id: u64,
-        participant: Address,
-        solution_hash: BytesN<32>,
-    ) -> Result<(), Error> {
-        require_not_paused(&env)?;
-        participant.require_auth();
-        let mut bounty = load(&env, bounty_id)?;
-
-        if bounty.status != BountyStatus::Open {
-            return Err(Error::BountyNotOpen);
-        }
-        if !Self::is_participant(env.clone(), bounty_id, participant.clone()) {
-            return Err(Error::NotParticipant);
-        }
-        if env.ledger().timestamp() > bounty.deadline {
-            return Err(Error::DeadlinePassed);
-        }
-
-        let key = DataKey::Submission(bounty_id, participant.clone());
-        if !env.storage().persistent().has(&key) {
-            bounty.submission_count += 1;
-            save(&env, &bounty);
-        }
-        env.storage().persistent().set(&key, &solution_hash);
-        bump_record(&env, &key);
-
-        emit_solution_submitted(&env, bounty_id, participant, solution_hash);
-        Ok(())
-    }
-
-    /// Creator picks a winner among participants who submitted; the escrowed
-    /// reward is paid to them immediately.
-    pub fn select_winner(env: Env, bounty_id: u64, winner: Address) -> Result<(), Error> {
-        require_not_paused(&env)?;
-        require_not_locked(&env)?;
-        let mut bounty = load(&env, bounty_id)?;
-        bounty.creator.require_auth();
-
-        if bounty.status != BountyStatus::Open {
-            return Err(Error::BountyNotOpen);
-        }
-        if !Self::is_participant(env.clone(), bounty_id, winner.clone()) {
-            return Err(Error::NotParticipant);
-        }
-        if Self::get_submission(env.clone(), bounty_id, winner.clone()).is_none() {
-            return Err(Error::NoSubmission);
-        }
-
-        bounty.status = BountyStatus::Completed;
-        bounty.winner = Some(winner.clone());
-        save(&env, &bounty);
-        pay_out(&env, &bounty.token, &winner, bounty.reward_amount);
-
-        emit_winner_selected(&env, bounty_id, winner, bounty.reward_amount);
-        Ok(())
-    }
-
-    /// Creator withdraws an open bounty before anyone has joined.
-    pub fn cancel_bounty(env: Env, bounty_id: u64) -> Result<(), Error> {
-        require_not_locked(&env)?;
-        let mut bounty = load(&env, bounty_id)?;
-        bounty.creator.require_auth();
-
-        if bounty.status != BountyStatus::Open {
-            return Err(Error::BountyNotOpen);
-        }
-        if bounty.current_participants > 0 {
-            return Err(Error::HasParticipants);
-        }
-
-        bounty.status = BountyStatus::Cancelled;
-        save(&env, &bounty);
-        pay_out(&env, &bounty.token, &bounty.creator, bounty.reward_amount);
-
-        emit_cancelled(&env, bounty_id, bounty.creator, bounty.reward_amount);
-        Ok(())
-    }
-
-    /// After the deadline, the creator recovers the reward if nobody submitted
-    /// a solution. With submissions on the table, a winner must be chosen (or
-    /// the admin decides through a dispute).
-    pub fn refund(env: Env, bounty_id: u64) -> Result<(), Error> {
-        require_not_locked(&env)?;
-        let mut bounty = load(&env, bounty_id)?;
-        bounty.creator.require_auth();
-
-        if bounty.status != BountyStatus::Open {
-            return Err(Error::BountyNotOpen);
-        }
-        if env.ledger().timestamp() <= bounty.deadline {
-            return Err(Error::DeadlineNotPassed);
-        }
-        if bounty.submission_count > 0 {
-            return Err(Error::HasSubmissions);
-        }
-
-        bounty.status = BountyStatus::Refunded;
-        save(&env, &bounty);
-        pay_out(&env, &bounty.token, &bounty.creator, bounty.reward_amount);
-
-        emit_refunded(&env, bounty_id, bounty.creator, bounty.reward_amount);
-        Ok(())
-    }
-
-    /// A participant who submitted can escalate to the admin once the deadline
-    /// has passed without the creator choosing a winner.
-    pub fn raise_dispute(env: Env, bounty_id: u64, participant: Address) -> Result<(), Error> {
-        participant.require_auth();
-        let mut bounty = load(&env, bounty_id)?;
-
-        if bounty.status != BountyStatus::Open {
-            return Err(Error::BountyNotOpen);
-        }
-        if env.ledger().timestamp() <= bounty.deadline {
-            return Err(Error::DeadlineNotPassed);
-        }
-        if Self::get_submission(env.clone(), bounty_id, participant.clone()).is_none() {
-            return Err(Error::NoSubmission);
-        }
-
-        bounty.status = BountyStatus::Disputed;
-        save(&env, &bounty);
-
-        emit_dispute_raised(&env, bounty_id, participant);
-        Ok(())
-    }
-
-    /// Admin settles a dispute: pay `winner` (who must have submitted), or
-    /// pass `None` to return the reward to the creator.
-    pub fn resolve_dispute(env: Env, bounty_id: u64, winner: Option<Address>) -> Result<(), Error> {
-        require_not_locked(&env)?;
-        admin(&env)?.require_auth();
-        let mut bounty = load(&env, bounty_id)?;
-
-        if bounty.status != BountyStatus::Disputed {
-            return Err(Error::NotDisputed);
-        }
-
-        let recipient = match winner {
-            Some(w) => {
-                if Self::get_submission(env.clone(), bounty_id, w.clone()).is_none() {
-                    return Err(Error::NoSubmission);
-                }
-                bounty.status = BountyStatus::Completed;
-                bounty.winner = Some(w.clone());
-                w
-            }
-            None => {
-                bounty.status = BountyStatus::Refunded;
-                bounty.creator.clone()
-            }
-        };
-        save(&env, &bounty);
-        pay_out(&env, &bounty.token, &recipient, bounty.reward_amount);
-
-        emit_dispute_resolved(&env, bounty_id, recipient, bounty.reward_amount);
-        Ok(())
-    }
-
-    /// Admin: stop new bounties, joins, submissions and winner selection.
-    /// Refunds, cancellations and dispute resolution keep working so funds
-    /// are never trapped.
+    /// Admin: stop new publications (revocations and reads keep working).
     pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
         let admin = admin(&env)?;
         admin.require_auth();
@@ -440,32 +216,76 @@ impl BountyContract {
 
     // ── Reads ───────────────────────────────────────────────────────────────
 
-    pub fn get_bounty(env: Env, bounty_id: u64) -> Result<Bounty, Error> {
-        load(&env, bounty_id)
+    pub fn get_report(env: Env, id: u64) -> Result<Report, Error> {
+        load(&env, id)
     }
 
-    /// Number of bounties ever created (ids are `1..=count`).
-    pub fn get_bounty_count(env: Env) -> u64 {
+    pub fn get_report_by_hash(env: Env, report_hash: BytesN<32>) -> Option<Report> {
+        let id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HashIndex(report_hash))?;
+        load(&env, id).ok()
+    }
+
+    /// True if this exact file was published and has not been revoked.
+    pub fn verify(env: Env, report_hash: BytesN<32>) -> bool {
+        Self::get_report_by_hash(env, report_hash).is_some_and(|r| !r.revoked)
+    }
+
+    /// Number of reports published (ids are `1..=count`).
+    pub fn get_report_count(env: Env) -> u64 {
         env.storage()
             .instance()
-            .get(&DataKey::BountyCount)
+            .get(&DataKey::ReportCount)
             .unwrap_or(0)
     }
 
-    pub fn is_participant(env: Env, bounty_id: u64, participant: Address) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::Participant(bounty_id, participant))
+    /// Up to `limit` reports with ids `start, start+1, …` (newest last).
+    pub fn get_reports(env: Env, start: u64, limit: u32) -> Result<Vec<Report>, Error> {
+        check_page(limit)?;
+        let count = Self::get_report_count(env.clone());
+        let mut out = Vec::new(&env);
+        let first = start.max(1);
+        let end = first
+            .saturating_add(limit as u64)
+            .min(count.saturating_add(1));
+        for id in first..end {
+            if let Ok(r) = load(&env, id) {
+                out.push_back(r);
+            }
+        }
+        Ok(out)
     }
 
-    pub fn get_submission(env: Env, bounty_id: u64, participant: Address) -> Option<BytesN<32>> {
+    pub fn get_author_report_count(env: Env, author: Address) -> u64 {
         env.storage()
             .persistent()
-            .get(&DataKey::Submission(bounty_id, participant))
+            .get(&DataKey::AuthorCount(author))
+            .unwrap_or(0)
     }
 
-    pub fn get_winner(env: Env, bounty_id: u64) -> Option<Address> {
-        load(&env, bounty_id).ok().and_then(|b| b.winner)
+    /// An author's reports in publication order, `start` counted from 0.
+    pub fn get_author_reports(
+        env: Env,
+        author: Address,
+        start: u64,
+        limit: u32,
+    ) -> Result<Vec<Report>, Error> {
+        check_page(limit)?;
+        let count = Self::get_author_report_count(env.clone(), author.clone());
+        let mut out = Vec::new(&env);
+        let end = start.saturating_add(limit as u64).min(count);
+        for n in start..end {
+            let id: Option<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::AuthorReport(author.clone(), n));
+            if let Some(Ok(r)) = id.map(|id| load(&env, id)) {
+                out.push_back(r);
+            }
+        }
+        Ok(out)
     }
 
     pub fn get_admin(env: Env) -> Result<Address, Error> {
