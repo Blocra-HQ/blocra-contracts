@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy the BlocRA bounty contract to Stellar testnet.
+# Deploy the BlocRA report registry to Stellar testnet.
 # Writes the contract ID to .env.testnet at the repo root.
 #
 # Usage: ./scripts/deploy-testnet.sh [--source <identity>] [--admin <G...>] [--fee <stroop>]
@@ -9,7 +9,7 @@
 #   - STELLAR_ACCOUNT env var set, or pass --source <identity>
 #   - Network: testnet (https://soroban-testnet.stellar.org)
 #
-# The admin (who can pause the contract and resolve disputes) defaults to the
+# The admin (who can pause publishing) defaults to the
 # deployer's address and is set by the constructor in the deploy transaction.
 
 set -euo pipefail
@@ -26,7 +26,7 @@ FEE="${STELLAR_FEE:-100}"
 # ── Parse arguments ────────────────────────────────────────────────────────────
 
 SOURCE="${STELLAR_ACCOUNT:-}"
-ADMIN="${BOUNTY_ADMIN:-}"
+ADMIN="${REGISTRY_ADMIN:-}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -51,7 +51,7 @@ info() { echo "  $*" >&2; }
 deploy_contract() {
     local name="$1"   # human-readable label
     local wasm="$2"   # path to .wasm file
-    local alias="$3"  # env-file key (e.g. BOUNTY_CONTRACT_ID)
+    local alias="$3"  # env-file key (e.g. REPORT_REGISTRY_CONTRACT_ID)
     shift 3           # the rest are constructor arguments
 
     log "Deploying ${name}..."
@@ -114,10 +114,10 @@ if [[ -z "${ADMIN}" ]]; then
 fi
 info "Admin: ${ADMIN}"
 
-BOUNTY_ID=$(deploy_contract \
-    "bounty" \
-    "${WASM_DIR}/bounty.wasm" \
-    "BOUNTY_CONTRACT_ID" \
+REGISTRY_ID=$(deploy_contract \
+    "report_registry" \
+    "${WASM_DIR}/report_registry.wasm" \
+    "REPORT_REGISTRY_CONTRACT_ID" \
     --admin "${ADMIN}")
 
 # ── Summary ────────────────────────────────────────────────────────────────────
@@ -126,6 +126,6 @@ echo ""
 log "Contract deployed successfully."
 log "Contract IDs written to: ${ENV_FILE}"
 echo ""
-echo "  BOUNTY_CONTRACT_ID=${BOUNTY_ID}"
+echo "  REPORT_REGISTRY_CONTRACT_ID=${REGISTRY_ID}"
 echo ""
-log "Set VITE_BOUNTY_CONTRACT_ID=${BOUNTY_ID} in the blocra-frontend environment."
+log "Set VITE_REPORT_REGISTRY_CONTRACT_ID=${REGISTRY_ID} in the blocra-frontend environment."
